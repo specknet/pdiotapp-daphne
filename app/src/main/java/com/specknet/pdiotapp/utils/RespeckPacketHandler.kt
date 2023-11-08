@@ -34,12 +34,15 @@ class RESpeckPacketHandler(val speckService: BluetoothSpeckService) {
             (values.size < 192) -> fun(_: ByteArray) {
                 Log.e(
                     "RAT",
-                    "UNKNOWN RESPECK VERSION: $fwVersionStr"
+                    "UNKNOWN RESPECK VERSION (packet too short): $fwVersionStr"
                 )
             }
             else -> {
                 when (fwVersionStr.first()) {
                     '6' -> { v: ByteArray -> processRESpeckV6Packet(v) }
+                    '5' -> { v: ByteArray -> processRESpeckV5Packet(v) }
+                    // v4 should be same packet format as v5
+                    '4' -> { v: ByteArray -> processRESpeckV5Packet(v) }
                     else -> fun(_: ByteArray) {
                         Log.e(
                             "RAT",
@@ -95,6 +98,170 @@ class RESpeckPacketHandler(val speckService: BluetoothSpeckService) {
             Log.i("RESpeckPacketHandler", "Respeck battery level: ${r.battLevel}")
             Log.i("RESpeckPacketHandler", "Respeck charging?: ${r.chargingStatus}")
         }
+
+        // If this is our first sequence, or the last sequence was more than 2.5 times the average time
+        // difference in the past, we use the typical time difference between the RESpeck packets for
+        // determining the previous timestamp. This only affects the minute calculations. The breathing rate
+        // is calculated based on only the sampling rate.
+        // TODO this needs to be checked for consistency: IMU mode will produce different timestamps
+        mPhoneTimestampLastPacketReceived =
+            if (mPhoneTimestampCurrentPacketReceived == -1L || mPhoneTimestampCurrentPacketReceived + 2.5 * Constants.AVERAGE_TIME_DIFFERENCE_BETWEEN_RESPECK_PACKETS < actualPhoneTimestamp) {
+                actualPhoneTimestamp - Constants.AVERAGE_TIME_DIFFERENCE_BETWEEN_RESPECK_PACKETS
+            } else {
+                // Store the previously used phone timestamp as previous timestamp
+                mPhoneTimestampCurrentPacketReceived
+            }
+
+        // TODO this needs to be checked for consistency: IMU mode will produce different timestamps
+        val extrapolatedPhoneTimestamp =
+            mPhoneTimestampLastPacketReceived + Constants.AVERAGE_TIME_DIFFERENCE_BETWEEN_RESPECK_PACKETS
+
+        // If the last timestamp plus the average time difference is more than
+        // x seconds apart, we use the actual phone timestamp. Otherwise, we use the
+        // last plus the average time difference.
+        // TODO this needs to be checked for consistency: IMU mode will produce different timestamps
+        mPhoneTimestampCurrentPacketReceived =
+            when (abs(extrapolatedPhoneTimestamp - actualPhoneTimestamp) > Constants.MAXIMUM_MILLISECONDS_DEVIATION_ACTUAL_AND_CORRECTED_TIMESTAMP) {
+                true -> actualPhoneTimestamp
+                false -> extrapolatedPhoneTimestamp
+            }
+
+        // Similar calculations needed for the respeck timestamp for each sample
+        mRESpeckTimestampLastPacketReceived = if (mRESpeckTimestampCurrentPacketReceived == -1L) {
+            // If this is our first packet, make an approximation
+            r.respeckTimestamp - Constants.AVERAGE_TIME_DIFFERENCE_BETWEEN_RESPECK_PACKETS
+        } else {
+            // Store the previously used RESpeck timestamp as the previous timestamp
+            mRESpeckTimestampCurrentPacketReceived
+        }
+
+        // Update the current respeck timestamp
+
+        // Update the current respeck timestamp
+        mRESpeckTimestampCurrentPacketReceived = r.respeckTimestamp
+
+        currentSequenceNumberInBatch = 0
+
+        for ((_, acc, gyro, _, highFrequency) in r.batchData) {
+            val x = acc.x
+            val y = acc.y
+            val z = acc.z
+
+            // Calculate interpolated timestamp of current sample based on sequence number
+            // There are 32 samples in each acceleration batch the RESpeck sends.
+            val interpolatedPhoneTimestampOfCurrentSample =
+                ((mPhoneTimestampCurrentPacketReceived - mPhoneTimestampLastPacketReceived) * (currentSequenceNumberInBatch * 1.0 / Constants.NUMBER_OF_SAMPLES_PER_BATCH)).toLong() + mPhoneTimestampLastPacketReceived
+
+            // Calculate a similar interpolated timestamp of the current sample using the respeck timestamp
+            val interpolatedRespeckTimestampOfCurrentSample =
+                ((mRESpeckTimestampCurrentPacketReceived - mRESpeckTimestampLastPacketReceived) * (currentSequenceNumberInBatch * 1.0 / Constants.NUMBER_OF_SAMPLES_PER_BATCH)).toLong() + mRESpeckTimestampLastPacketReceived
+
+            // Store the respeck timestamps (not phone!) for the frequency estimation
+            frequencyTimestampsRespeck.add(interpolatedRespeckTimestampOfCurrentSample)
+
+            // check for the full minute before creating the live data package
+            // Also calculate the approximation of the true sampling frequency
+            var currentProcessedMinute = DateUtils.truncate(
+                Date(mPhoneTimestampCurrentPacketReceived),
+                Calendar.MINUTE
+            ).time
+
+
+            if (currentProcessedMinute != lastProcessedMinute) {
+                var currentRespeckFrequency: Float
+                if (minuteFrequencies.size < Constants.MINUTES_FOR_MEDIAN_CALC) {
+                    Log.i("Freq", "One minute passed, calculating frequency")
+                    // calculate an approximation of the sampling frequency
+                    // and add it to a list for running median
+                    currentRespeckFrequency = calculateRespeckSamplingFrequency()
+                    minuteRespeckFrequencies.add(currentRespeckFrequency)
+                    Collections.sort(minuteRespeckFrequencies)
+                    var medianRespeckFrequency: Float
+                    medianRespeckFrequency = if (minuteRespeckFrequencies.size % 2 == 0) {
+                        //Average 2 middle values
+                        (minuteRespeckFrequencies[minuteRespeckFrequencies.size / 2] + minuteRespeckFrequencies[minuteRespeckFrequencies.size / 2 - 1]) / 2
+                    } else {
+                        //Take middle value
+                        minuteRespeckFrequencies[minuteRespeckFrequencies.size / 2]
+                    }
+                    Log.i("Freq", "medianFrequency = $medianRespeckFrequency")
+                    if (medianRespeckFrequency > 10 && medianRespeckFrequency < 15) {
+                        mSamplingFrequency = medianRespeckFrequency
+                    }
+                    Log.i("Freq", "median respeck frequency = $medianRespeckFrequency")
+                }
+                //After this, just stick to final mSamplingFrequency calculated.
+            }
+
+            // TODO: add gyroscope data to RESpeck packet (convert to Kotlin for easy constructor)
+            val newRESpeckLiveData = RESpeckLiveData(
+                interpolatedPhoneTimestampOfCurrentSample,
+                interpolatedRespeckTimestampOfCurrentSample,
+                currentSequenceNumberInBatch,
+                x, y, z,
+                mSamplingFrequency,
+                r.battLevel,
+                r.chargingStatus,
+                gyro,
+                highFrequency = highFrequency
+            )
+            Log.i("Freq", "newRespeckLiveData = $newRESpeckLiveData")
+
+            // Store the important data in the external storage if set in config
+            if (mIsStoreDataLocally) {
+                writeToCsv(newRESpeckLiveData, useIMU)
+            }
+
+            // Send live broadcast intent
+            val liveDataIntent = Intent(Constants.ACTION_RESPECK_LIVE_BROADCAST)
+            liveDataIntent.putExtra(Constants.RESPECK_LIVE_DATA, newRESpeckLiveData)
+            speckService.sendBroadcast(liveDataIntent)
+
+            // Every full minute, calculate the average breathing rate in that minute. This value will
+            // only change after a call to "calculateAverageBreathing".
+            currentProcessedMinute = DateUtils.truncate(
+                Date(mPhoneTimestampCurrentPacketReceived),
+                Calendar.MINUTE
+            ).time
+            if (currentProcessedMinute != lastProcessedMinute) {
+
+                lastProcessedMinute = currentProcessedMinute
+            }
+            currentSequenceNumberInBatch += 1
+        }
+
+    }
+
+    fun processRESpeckV5Packet(values: ByteArray) {
+        val useIMU = false
+        Log.d("BLT", "processRESpeckV5Packet: here")
+        // Independent of the RESpeck timestamp, we use the phone timestamp
+        val actualPhoneTimestamp = Utils.getUnixTimestamp()
+        Log.d("V5Decode: Process", values.contentToString())
+
+
+
+        val r = RESpeckPacketDecoder.V5.decodePacket(values, 0)
+
+        Log.d("V5Decode: Decoded", r.batchData.toString())
+
+        // invert takeIMU to take or skip the next packet
+
+        // wrap detection - no side effects??
+        // don't do this if in IMU mode: no sequence number
+        if (last_seq_number >= 0 && r.seqNumber - last_seq_number != 1 || !useIMU) {
+            // have we just wrapped?
+            if (r.seqNumber == 0 && last_seq_number == 65535) {
+                Log.w("RESpeckPacketHandler", "Respeck seq number wrapped")
+            } else {
+                Log.w(
+                    "RESpeckPacketHandler", "Unexpected respeck seq number. Expected: ${last_seq_number + 1}, received: ${r.seqNumber}"
+                )
+                restartRespeckSamplingFrequency()
+            }
+        }
+        last_seq_number = r.seqNumber
+
 
         // If this is our first sequence, or the last sequence was more than 2.5 times the average time
         // difference in the past, we use the typical time difference between the RESpeck packets for

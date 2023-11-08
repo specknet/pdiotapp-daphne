@@ -77,7 +77,7 @@ public class BluetoothSpeckService extends Service {
     private BroadcastReceiver respeckIMUChangeReceiver;
 
     private boolean mIsRESpeckPaused;
-    private boolean respeckUseIMUCharacteristic = true;
+    private boolean respeckUseIMUCharacteristic = false;
 
     private Observable<RxBleConnection> respeckConnection;
 
@@ -381,6 +381,10 @@ public class BluetoothSpeckService extends Service {
             if (fwV.contains("4") || fwV.contains("5") || fwV.contains("6")) {
                 // characteristic to use depends on IMU setting
                 respeck_characteristic = Constants.RESPECK_LIVE_V4_CHARACTERISTIC;
+
+                if (fwV.contains("6")) { //only respeck v6 has working gyro
+                    respeckUseIMUCharacteristic = true;
+                }
             } else {
                 respeck_characteristic = Constants.RESPECK_LIVE_CHARACTERISTIC;
             }
